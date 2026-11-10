@@ -1,0 +1,211 @@
+waypoint_follower:
+  ros__parameters:
+    # Speed goes to 0 when /odom has been silent this long; the control loop
+    # would otherwise keep steering toward a frozen pose at mission speed.
+    # Kept below the PCU's own Auto_Fail watchdog (ERP_Racing manual sec.
+    # 5-2/4: Auto_Fail, then Full Braking, 0.3 s after the HLV link goes
+    # quiet), so WF's own ramped stop always gets there first; 0.5 s let the
+    # PCU's harder stop win instead.
+    odom_timeout_sec: 0.25
+
+    # Same watchdog for /final_waypoint: stop, wheel centred, when no path has
+    # arrived for this long or the last one has under 2 points. Without it the
+    # car kept following the last path after local_path_publisher went quiet
+    # (it publishes nothing when it finds no closest waypoint), and an empty
+    # path drove it straight on at mission speed. local_path_publisher sends
+    # one path per /odom message, hence the same value as odom_timeout_sec.
+    path_timeout_sec: 0.25
+
+    # Steering slew-rate limit [deg/s], the steering counterpart of the speed
+    # ramp below. The ERP42 Racing steering actuator is a position servo with
+    # no published slew spec, and neither the HLV<->PCU protocol nor
+    # serial_bridge.cpp limits how far the target angle can move between
+    # cycles, so a noisy heading/cross-track term can hand it a fresh step
+    # every 50 ms cycle. 90.0 is an untested, conservative starting point --
+    # MEASURE on the vehicle and adjust. 0 = off (previous behaviour).
+    steer:
+      rate_limit_deg_s: 30.0
+
+    # Localisation latency [s]. The pose is projected forward by this much before
+    # steering is computed. Only the GPS/INS delay belongs here, not the steering
+    # actuator lag: 0.1 s cut the mean cross-track error by a quarter in
+    # closed-loop simulation, 0.35 s made it 2.5x worse. MEASURE on the vehicle
+    # (test/fit_from_bag.py). Simulated lag 0.1 s, 25 km/h, 36 laps each:
+    # 0.1 -> nominal CTE rms 0.022 m, but 1 lap 0.50 m off when the real lag
+    # was 0.3 s; 0.15 -> rms 0.032 m, worst 0.38 m under every stress case.
+    # Too little compensation weaves, too much only costs ~1 cm, hence 0.15
+    # until the lag is measured.
+    delay_comp_sec: 0.2
+
+    # /odom is the INS position, offset_m ahead of the rear axle (MEASURE with a
+    # tape; 0.62 is the estimate from the bag's cornering slip angle). Pure
+    # pursuit then steers the rear axle and Stanley the front axle, each against
+    # the path that axle draws. enable: false = previous behaviour (/odom taken
+    # as the rear axle); offset_m 0.0 is NOT the same thing.
+    reference:
+      enable: true
+      offset_m: 0.55
+
+    # ── Stanley ───────────────────────────────────────────────────────────────
+    # delta = k_ang*dpsi + atan(k_dist*e / (k_damp*v + k_soft))
+    #         + k_rate*(r_meas - r_path) + k_steer*(delta_cmd - delta_meas)
+    # Hoffmann et al. 2007, with the k_damp / k_rate / k_steer extensions
+    # evaluated in arXiv:2408.15152.
+    stanley:
+      k_ang: 1.0
+      # Cross-track gain. The previous code put the path curvature here, which
+      # zeroed the term on straights -- exactly where it is needed.
+      k_dist: 0.8
+      # Keeps the denominator finite; without it atan2(k*e, v) swings to +-90 deg
+      # as the vehicle stops.
+      k_soft: 1.0
+      k_damp: 1.0
+      # Yaw-rate damping, from the measured steering angle via the bicycle model.
+      k_rate: 0.05
+      # Pushes on the part of the last command the wheels have not reached yet.
+      k_steer: 0.2
+      # Path tangent for the heading term: chord over +-this many metres of arc,
+      # at the front axle's projection onto the nearest segment. The recorded
+      # ryaw (and any single 0.1 m segment) jitters 1.7 deg std on 0.csv; in
+      # closed-loop sim 1.0 cut high-frequency steering 1.8 -> 0.3 deg with the
+      # same cross-track error. 0.0 = old nearest waypoint + ryaw (rollback).
+      tangent_half_window_m: 1.0
+      # Pure pursuit keeps the low-speed corners; Stanley fades in with speed.
+      # 0.7 cut the worst cross-track error by ~30% vs 0.4 in simulation, at the
+      # cost of busier steering (p99 rate 14 -> 21 deg/s).
+      max_ratio: 0.0
+      fade_lo_mps: 1.5
+      fade_hi_mps: 5.0
+
+    # ── Speed-scheduled lookahead ─────────────────────────────────────────────
+    # Ld = clamp(gain*v + min, min, max), then capped by the per-mission-state
+    # value so tight corners keep their hand-tuned short lookahead.
+    lookahead:
+      gain: 1.6
+      min_m: 4.0
+      max_m: 11.0
+      # Cap per mission state 0..15 [m]; negative = the table in ldStateCapM()
+      # (waypointFollower.h: 11/4.75/6/6/5.25/5.25/11/6/8/6/8/5.5/6/5.25/11/11),
+      # 0 = no cap. Raising the straight states 2/4/8/10 did not reduce any
+      # oscillation in closed-loop sim up to 25 km/h and made the next corner
+      # 3-7 cm worse, so the table is unchanged. To try it anyway:
+      #   [-1.0, -1.0, 9.0, -1.0, 8.0, -1.0, -1.0, -1.0,
+      #    11.0, -1.0, 11.0, -1.0, -1.0, -1.0, -1.0, -1.0]
+      # All 0 here: the per-state table is replaced by the curvature cap below.
+      # (Without the curvature cap, 0 lets the lookahead reach 11-12 m entering
+      # the R4.6 bend and the car cuts it.) Rollback to the table: all -1.0.
+      state_cap_m: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+      # Curvature-linked cap Ld <= curv_coef * sqrt(R), R = tightest radius in
+      # the next Ld of path, never below curv_min_m, kept curv_hold_m past the
+      # rear axle. Gives ~4.9 m in the R4.6 bend, 8-9 m in the rotary, 6-7.6 m
+      # in the other bends, 11 m on straights. Sim, all states 25 km/h, no
+      # per-state cap: 0/22 laps > 0.5 m off (speed-scheduled Ld alone 3/22,
+      # cap without the hold 2/22). curv_coef 0.0 = off.
+      curv_coef: 2.0
+      curv_min_m: 3.0
+      curv_hold_m: 5.0
+      # Rate limit on the per-state cap [m/s]; 0 = none. Stops a cap change at a
+      # state boundary from stepping the steering; growth is slower so the
+      # lookahead stays short for a few seconds after a corner and the steering
+      # does not unwind early. The speed schedule under the cap is not limited.
+      rate_up_mps: 2.0
+      rate_down_mps: 4.0
+
+    # ── Curvature speed profile ───────────────────────────────────────────────
+    # v_lim = sqrt(a_lat_max / |k|), then a backward pass at a_dec_max so the
+    # car is already slow when it arrives rather than braking in the corner.
+    # On the default course a_lat_max = 3.0 takes the tightest bend (R = 4.6 m)
+    # at about 13 km/h.
+    speed:
+      a_lat_max: 4.5
+      # The backward pass plans to brake at this rate, so it must not exceed
+      # what the vehicle can actually achieve; 1.5 assumed better braking than
+      # a degraded case (worn brakes, wet track, weak driveline braking)
+      # delivers. Under a stress test that only achieves 0.8 m/s^2, the profile
+      # entered the tightest bend at ~19 km/h instead of its ~13 km/h limit and
+      # ran 0.35-0.40 m wide; 1.0 enters at ~15 km/h and cuts that to 0.21-0.31 m,
+      # at no cost to nominal tracking or lap time (+0.5 s of 77.5 s). MEASURE
+      # the vehicle's real braking deceleration and raise this if it exceeds 1.0.
+      # 감속 능력 a dec max 낮을수록 감속 못해
+      a_dec_max: 0.6
+      a_acc_max: 1.5
+      profile_horizon_m: 25.0
+      # k is the circle through the waypoints +-this far along the path. The
+      # recorded rk column is too noisy to use point by point (R ~2 m on
+      # straights); 0.0 falls back to it.
+      curvature_half_window_m: 2.0
+      # Command the limit of the point the car will reach after the speed loop
+      # lag. Without it the tightest corner was entered at 17 km/h instead of 12.
+      lag_comp_sec: 1.27
+      # Keep a corner's limit until the rear axle is this far past it. Without it
+      # the car speeds up while the wheels are still unwinding, and back-to-back
+      # corners (tight bend -> rotary, states 5 -> 6 on 0.csv) grew that into
+      # ~1 m excursions in about 1 lap in 6 under slow steering or weak braking.
+      # Closed-loop sim, all states at 25: that failure mode is gone with 5 m
+      # (3 m still showed it), but ~9 % of nominal laps still ran wide at other
+      # curve exits, which is a controller-tuning issue, not this hold.
+      # 0.0 = off (previous behaviour).
+      exit_hold_m: 2.0
+      # Brake for a slower mission state BEFORE reaching it: every waypoint's
+      # mission speed (Waypoint.mission_state -> mission.state_kmh / table) joins
+      # the curvature limits in the backward pass above. Without it a state's
+      # cap only applied once the car was in that state (a 25 -> 8 km/h step was
+      # entered at ~20 km/h). false = previous behaviour.
+      anticipate_mission: true
+
+    # ── Hunting detector ──────────────────────────────────────────────────────
+    # Speed x factor when the lateral acceleration v^2*tan(delta)/L (measured
+    # wheel angle, low-passed) swings past +-min_lat_acc flip_trigger times
+    # within window_sec. The cut starts at flip_trigger flips and bottoms out
+    # at min_factor three flips later. The raw command is too noisy at speed
+    # (0.5 m/s^2 is 0.7 deg at 25 km/h), hence the measured angle + filter.
+    # 8 s holds ~2.5 periods of the 0.33 Hz weave seen at 25 km/h with a slow
+    # localisation; 6 s saw only 4-5 flips of it. False triggers on clean
+    # simulated laps: 2 in 385 (each a brief x0.9).
+    # Previous detector: min_lat_acc 0.0 (= min_steer_deg on the command),
+    # window_sec 2.0, flip_trigger 5.
+    #
+    # Minimum detectable frequency is roughly flip_trigger / (2*window_sec).
+    # 8 s / 4 flips only catches down to ~0.25 Hz, but this file's own
+    # comment above records simulated weaves as slow as 0.12 Hz (period
+    # ~8.3 s) -- at 8 s/4 that band gets 1-2 flips and never trips the
+    # detector, so it would still be published undamped. 20 s / 3 flips
+    # lowers the floor to 0.075 Hz, giving a 0.12 Hz weave ~4-5 flips of
+    # margin, at the cost of reacting more slowly to genuinely fast hunting;
+    # the steering slew-rate limiter above is meant to catch that case before
+    # it needs this detector at all. Re-tune against simulated/real weave data
+    # once available.
+    osc:
+      min_lat_acc: 0.5
+      lpf_sec: 0.3
+      min_steer_deg: 3.0
+      window_sec: 8.0
+      flip_trigger: 4
+      min_factor: 0.6
+
+    # Speed cut on cross-track error: none below deadband_m, min_factor at
+    # full_m. Code default deadband is 0.25 m; measured CTE p95 was 0.29 m.
+    cte:
+      deadband_m: 0.35
+      full_m: 1.2
+      min_factor: 0.5
+
+    # ── Mission speed [km/h] ───────────────────────────────────────────────
+    # uniform_kmh: one speed for every mission state; the curvature profile
+    # (speed.*) slows the car for each bend by itself and the curvature cap
+    # (lookahead.curv_*) shortens the lookahead. Negative = per-state speeds
+    # (state_kmh, or the table in missionSpeedKmh():
+    # 15/8/15/12/11/7/15/8/15/11/15/8/12/6/15/15). The plant is not fitted yet:
+    # on the vehicle raise it in steps, 15 -> 20 -> 25.
+    #
+    # 18.0 while the plant is still unfitted. Every tuning value below this line
+    # and in lookahead/stanley/osc comes from closed-loop simulation, not from a
+    # vehicle bag, and speed.a_lat_max (the tyre grip the whole curvature speed
+    # profile rests on) has never been measured at all. Raise towards 25 only
+    # after test/fit_from_bapy has run on a real recording -- see
+    # TUNING_NOTES.md section 4.
+    mission:
+      uniform_kmh: 25.0
+      state_kmh: [-1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0,
+                  -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]
