@@ -4,6 +4,10 @@ A ROS 2 path tracking controller for a small autonomous vehicle. It follows a re
 
 Steering blends pure pursuit with an extended Stanley law, and speed comes from a curvature-based profile with additional limits for tracking error and oscillation. The controller was developed on an ERP42 Racing platform. The repository is self-contained: every message type it uses is defined in the bundled `waypoint_follower_msgs` package, so it builds with a standard ROS 2 installation and nothing else.
 
+<p align="center"><img src="docs/run_2x.gif" alt="The car following the recorded path at night" width="480"></p>
+
+*The controller on the car during a night test run, 2x speed. Full-quality clip: [`docs/run_2x.mp4`](docs/run_2x.mp4).*
+
 ## Packages
 
 ```
